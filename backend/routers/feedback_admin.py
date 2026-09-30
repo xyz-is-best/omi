@@ -88,7 +88,12 @@ def list_feedback_reports(
     limit: int = Query(default=30, ge=1, le=90),
 ):
     """Dates that have a materialized report, newest first."""
-    return FeedbackReportDatesResponse(dates=feedback_db.list_report_dates(min(limit, 90)))
+    try:
+        dates = feedback_db.list_report_dates(min(limit, 90))
+    except Exception as e:
+        logger.error(f'Failed to list feedback report dates: {e}', exc_info=True)
+        raise HTTPException(status_code=500, detail='Failed to retrieve feedback report dates') from e
+    return FeedbackReportDatesResponse(dates=dates)
 
 
 @router.get('/v1/admin/feedback/reports/{report_date}', tags=['admin'], response_model=FeedbackReport)
@@ -98,7 +103,11 @@ def get_feedback_report(
 ):
     """One day's report: counts plus pointer windows. Carries no message text."""
     day = _parse_date(report_date).isoformat()
-    report = feedback_db.get_report(day)
+    try:
+        report = feedback_db.get_report(day)
+    except Exception as e:
+        logger.error(f'Failed to retrieve feedback report for {day}: {e}', exc_info=True)
+        raise HTTPException(status_code=500, detail='Failed to retrieve feedback report') from e
     if report is None:
         raise HTTPException(status_code=404, detail=f'No feedback report for {day}')
     return report
@@ -121,7 +130,11 @@ def generate_feedback_report(
     """
     day = _parse_date(report_date)
     logger.info(f'{admin_id} generating feedback report for {day.isoformat()}')
-    report = run_daily_report(day)
+    try:
+        report = run_daily_report(day)
+    except Exception as e:
+        logger.error(f'Failed to generate daily feedback report for {day.isoformat()}: {e}', exc_info=True)
+        raise HTTPException(status_code=500, detail='Failed to generate feedback report') from e
     return FeedbackReportGenerateResponse(
         date=report.date,
         total_negative=report.total_negative,
@@ -138,7 +151,11 @@ def generate_yesterdays_feedback_report(admin_id: str = Depends(_verify_admin_ke
     """Nightly cron target — no date arithmetic in the scheduler config."""
     day = previous_utc_day()
     logger.info(f'{admin_id} generating nightly feedback report for {day.isoformat()}')
-    report = run_daily_report(day)
+    try:
+        report = run_daily_report(day)
+    except Exception as e:
+        logger.error(f'Failed to generate nightly feedback report for {day.isoformat()}: {e}', exc_info=True)
+        raise HTTPException(status_code=500, detail='Failed to generate nightly feedback report') from e
     return FeedbackReportGenerateResponse(
         date=report.date,
         total_negative=report.total_negative,
@@ -165,30 +182,52 @@ def get_feedback_event_context(
     logged with the event id and the admin key hash, so reads of user chat are
     attributable after the fact.
     """
-    event = feedback_db.get_feedback_event(event_id)
+    clean_event_id = event_id.strip()
+    if not clean_event_id or len(clean_event_id) > 128:
+        raise HTTPException(status_code=400, detail='Invalid event ID format')
+
+    try:
+        event = feedback_db.get_feedback_event(clean_event_id)
+    except Exception as e:
+        logger.error(f'Failed to load feedback event {clean_event_id}: {e}', exc_info=True)
+        raise HTTPException(status_code=500, detail='Failed to load feedback event') from e
+
     if event is None:
-        raise HTTPException(status_code=404, detail=f'No feedback event {event_id}')
+        raise HTTPException(status_code=404, detail=f'No feedback event {clean_event_id}')
 
     pointer = None
     if report_date:
-        report = feedback_db.get_report(_parse_date(report_date).isoformat())
+        parsed_day = _parse_date(report_date).isoformat()
+        try:
+            report = feedback_db.get_report(parsed_day)
+        except Exception as e:
+            logger.error(f'Failed to load feedback report {parsed_day}: {e}', exc_info=True)
+            report = None
         if report:
-            pointer = next((e.context for e in report.entries if e.event.id == event_id), None)
+            pointer = next((e.context for e in report.entries if e.event.id == clean_event_id), None)
 
     if pointer is None:
         # No stored window (event outside any report, or a report predating a
         # window-shape change) — resolve it live so the route still answers.
         from utils.feedback_context import resolve_context
 
-        pointer = resolve_context(
-            event.uid,
-            event.target_kind,
-            event.target_id,
-            chat_session_id=event.chat_session_id,
-        )
-        pointer.event_id = event_id
+        try:
+            pointer = resolve_context(
+                event.uid,
+                event.target_kind,
+                event.target_id,
+                chat_session_id=event.chat_session_id,
+            )
+            pointer.event_id = clean_event_id
+        except Exception as e:
+            logger.error(f'Failed to resolve feedback context for event {clean_event_id}: {e}', exc_info=True)
+            raise HTTPException(status_code=500, detail='Failed to resolve feedback context') from e
 
     logger.info(
-        f'{admin_id} read feedback context for event {event_id} (uid hash {hashlib.sha256(event.uid.encode()).hexdigest()[:8]})'
+        f'{admin_id} read feedback context for event {clean_event_id} (uid hash {hashlib.sha256(event.uid.encode()).hexdigest()[:8]})'
     )
-    return hydrate_context(pointer)
+    try:
+        return hydrate_context(pointer)
+    except Exception as e:
+        logger.error(f'Failed to hydrate feedback context for event {clean_event_id}: {e}', exc_info=True)
+        raise HTTPException(status_code=500, detail='Failed to decrypt feedback context') from e
